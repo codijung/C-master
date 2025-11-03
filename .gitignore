@@ -1,0 +1,32 @@
+﻿# Visual Studio
+.vs/
+*.vsidx
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build outputs
+bin/
+obj/
+Debug*/
+Release*/
+x64/
+x86/
+
+# NuGet
+packages/
+*.nupkg
+project.lock.json
+package-lock.json
+*.lock
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

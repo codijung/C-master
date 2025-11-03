@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ColumnRebar.Calculator\ColumnRebar.Calculator.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="accoremgd">
+      <HintPath>D:\AutoCAD 2026\accoremgd.dll</HintPath>
+    </Reference>
+    <Reference Include="Acdbmgd">
+      <HintPath>D:\AutoCAD 2026\acdbmgd.dll</HintPath>
+    </Reference>
+    <Reference Include="Acmgd">
+      <HintPath>D:\AutoCAD 2026\acmgd.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

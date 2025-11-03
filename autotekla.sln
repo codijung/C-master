@@ -1,0 +1,37 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36616.10
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "autocadplugin", "autotekla\autocadplugin.csproj", "{449FE71C-C83A-41F9-A9E6-86EE499470E9}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "teklaplugin", "teklaplugin\teklaplugin.csproj", "{396977D6-E290-4E5B-8B07-A5B8E10C54AE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ColumnRebar.Calculator", "ColumnRebar.Calculator\ColumnRebar.Calculator.csproj", "{9197960C-AE7F-49E3-8F4D-050C4589D13B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{449FE71C-C83A-41F9-A9E6-86EE499470E9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{449FE71C-C83A-41F9-A9E6-86EE499470E9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{449FE71C-C83A-41F9-A9E6-86EE499470E9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{449FE71C-C83A-41F9-A9E6-86EE499470E9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{396977D6-E290-4E5B-8B07-A5B8E10C54AE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{396977D6-E290-4E5B-8B07-A5B8E10C54AE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{396977D6-E290-4E5B-8B07-A5B8E10C54AE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{396977D6-E290-4E5B-8B07-A5B8E10C54AE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{9197960C-AE7F-49E3-8F4D-050C4589D13B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{9197960C-AE7F-49E3-8F4D-050C4589D13B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{9197960C-AE7F-49E3-8F4D-050C4589D13B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{9197960C-AE7F-49E3-8F4D-050C4589D13B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {CB84F6B7-183E-450E-9F4A-2C2CC568FCBA}
+	EndGlobalSection
+EndGlobal
