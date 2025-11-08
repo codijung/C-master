@@ -1,0 +1,415 @@
+using Autodesk.AutoCAD.Runtime;
+using Autodesk.AutoCAD.ApplicationServices;
+using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.Geometry;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text; // For StringBuilder
+
+namespace ConveniencePlugin
+{
+    /// <summary>
+    /// partial class 2: 
+    /// 단면 상세도(Detail) 분석 관련 헬퍼 메서드들을 포함합니다.
+    /// (class1.cs의 ReadColumnSchedule가 이 메서드들을 호출합니다)
+    /// </summary>
+    public partial class MyCommands
+    {
+        // ==========================================================
+        // (B) 단면 상세도(Detail) 분석 헬퍼 함수
+        // ==========================================================
+
+        /// <summary>
+        /// (⭐ B-1 - "원래" 필터링) 핵심 "범위 필터링 및 분석" 함수
+        /// </summary>
+        public SectionElements AnalyzeSectionDetailByRange(
+            Point3d minPoint,
+            Point3d maxPoint,
+            List<Entity> candidateEntities)
+        {
+            Editor ed = Application.DocumentManager.MdiActiveDocument.Editor;
+
+            // --- 1. (⭐ "원래" 필터링) ---
+            List<Entity> allEntities = new List<Entity>();
+            List<Circle> allMainBars = new List<Circle>();
+            List<Line> allLines = new List<Line>();
+
+            foreach (var ent in candidateEntities)
+            {
+                if (ent == null) continue;
+
+                if (ent is Circle circle)
+                {
+                    if (IsPointInside(circle.Center, minPoint, maxPoint))
+                    {
+                        allMainBars.Add(circle);
+                        allEntities.Add(circle);
+                    }
+                }
+                else if (ent is Line line)
+                {
+                    // (⭐ "원래" 엄격한 필터)
+                    // 선은 양 끝점이 모두 범위 안에 있어야 함
+                    if (IsPointInside(line.StartPoint, minPoint, maxPoint) &&
+                        IsPointInside(line.EndPoint, minPoint, maxPoint))
+                    {
+                        allLines.Add(line);
+                        allEntities.Add(line);
+                    }
+                }
+                else if (ent is Dimension dim)
+                {
+                    if (IsPointInside(dim.TextPosition, minPoint, maxPoint))
+                    {
+                        allEntities.Add(dim);
+                    }
+                }
+            }
+
+            try
+            {
+                // --- 3. 치수 분석 ---
+                FindSize(allEntities, out string width, out string height);
+
+                // --- 4. 주철근 분석 ---
+                if (allMainBars.Count < 4)
+                {
+                    return null; // (필터링된) 주철근 4개 미만
+                }
+                var numberedBars = SetMainBarNumbers(
+                    allMainBars,
+                    out List<Circle> cornerBars, // (⭐ "코너 철근" 리스트 확보)
+                    out int hNonCornerCount,
+                    out int vNonCornerCount
+                );
+
+                // --- 5. JBar 분석 ---
+                // 가상 중심축 계산
+                var centers = allMainBars.Select(c => c.Center).ToList();
+                double imaginaryCenterY = (centers.Min(p => p.Y) + centers.Max(p => p.Y)) / 2.0;
+                double imaginaryCenterX = (centers.Min(p => p.X) + centers.Max(p => p.X)) / 2.0;
+
+                // (⭐ 수정된 함수 호출)
+                FindJBars(
+                    allLines,
+                    imaginaryCenterX, imaginaryCenterY,
+                    cornerBars, // (⭐ "코너 철근" 리스트 전달)
+                    out List<Line> jBarsHorizontal,
+                    out List<Line> jBarsVertical
+                );
+
+                // --- 6. 관계 분석 ---
+                List<JBarRelationship> analysisResults = AnalyzeJBarRelationships(
+                    numberedBars,
+                    jBarsHorizontal,
+                    jBarsVertical
+                );
+
+                // --- 7. 결과 객체 생성 및 반환 ---
+                SectionElements results = new SectionElements
+                {
+                    Width = width,
+                    Height = height,
+                    TotalMainBars = numberedBars.Count,
+                    HorizontalNonCornerBars = hNonCornerCount,
+                    VerticalNonCornerBars = vNonCornerCount,
+                    JBars = analysisResults
+                };
+
+                return results; // 성공 시 결과 객체 반환
+            }
+            catch (System.Exception ex)
+            {
+                ed.WriteMessage($"\n[오류] 단면 상세도 필터링/분석 중 오류: {ex.Message}");
+                return null; // 예외 발생 시 null 반환
+            }
+        }
+
+        /// <summary>
+        /// (⭐ 신규 헬퍼) 점이 사각 범위(Min/Max) 내에 있는지 확인
+        /// </summary>
+        private bool IsPointInside(Point3d pt, Point3d min, Point3d max)
+        {
+            double rMinX = Math.Min(min.X, max.X);
+            double rMaxX = Math.Max(min.X, max.X);
+            double rMinY = Math.Min(min.Y, max.Y);
+            double rMaxY = Math.Max(min.Y, max.Y);
+
+            return (pt.X >= rMinX && pt.X <= rMaxX &&
+                    pt.Y >= rMinY && pt.Y <= rMaxY);
+        }
+
+        /// <summary>
+        /// (B-2) 치수 객체 (FindSize)
+        /// </summary>
+        private void FindSize(
+            List<Entity> allEntities,
+            out string width,
+            out string height)
+        {
+            width = "";
+            height = "";
+            const double tolerance = 1e-6;
+            const double rotationTolerance = 0.1;
+
+            const double PI = Math.PI;
+            const double PI_2 = Math.PI / 2.0;
+            const double PI_3_2 = 3.0 * Math.PI / 2.0;
+            const double TWO_PI = 2.0 * Math.PI;
+
+            var allDimensions = allEntities.OfType<Dimension>();
+
+            foreach (var dim in allDimensions)
+            {
+                string text = GetCleanDimText(dim);
+                if (string.IsNullOrEmpty(text)) continue;
+
+                bool isHorizontal = false;
+                bool isVertical = false;
+
+                if (dim is RotatedDimension rotDim)
+                {
+                    double lineRotation = rotDim.Rotation;
+                    double normalizedRotation = lineRotation % TWO_PI;
+                    if (normalizedRotation < 0) normalizedRotation += TWO_PI;
+
+                    if ((Math.Abs(normalizedRotation - 0.0) < rotationTolerance) ||
+                        (Math.Abs(normalizedRotation - PI) < rotationTolerance))
+                    {
+                        isHorizontal = true;
+                    }
+                    else if ((Math.Abs(normalizedRotation - PI_2) < rotationTolerance) ||
+                             (Math.Abs(normalizedRotation - PI_3_2) < rotationTolerance))
+                    {
+                        isVertical = true;
+                    }
+                }
+                else if (dim is AlignedDimension alDim)
+                {
+                    Vector3d vec = alDim.XLine2Point - alDim.XLine1Point;
+                    if (Math.Abs(vec.Y) < tolerance) isHorizontal = true;
+                    else if (Math.Abs(vec.X) < tolerance) isVertical = true;
+                }
+
+                if (isHorizontal && string.IsNullOrEmpty(width)) width = text;
+                else if (isVertical && string.IsNullOrEmpty(height)) height = text;
+
+                if (!string.IsNullOrEmpty(width) && !string.IsNullOrEmpty(height)) break;
+            }
+        }
+
+        /// <summary>
+        /// (B-3) 치수 텍스트 (GetCleanDimText)
+        /// </summary>
+        private string GetCleanDimText(Dimension dim)
+        {
+            string text = dim.DimensionText;
+            if (string.IsNullOrEmpty(text) || text == "<>")
+            {
+                text = dim.Measurement.ToString();
+            }
+            string cleanText = text.Replace(",", "").Trim();
+            if (double.TryParse(cleanText, out _))
+            {
+                return cleanText;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// (B-4) 주철근 번호 부여 (SetMainBarNumbers)
+        /// </summary>
+        private Dictionary<int, Circle> SetMainBarNumbers(
+            List<Circle> allMainBars,
+            out List<Circle> cornerBars,
+            out int horizontalNonCornerCount,
+            out int verticalNonCornerCount)
+        {
+            var numberedBars = new Dictionary<int, Circle>();
+            var pathBars = new List<Circle>();
+            cornerBars = new List<Circle>();
+            horizontalNonCornerCount = 0;
+            verticalNonCornerCount = 0;
+            const double tolerance = 1e-6;
+
+            var centers = allMainBars.Select(c => c.Center).ToList();
+            double minX = centers.Min(p => p.X);
+            double maxX = centers.Max(p => p.X);
+            double minY = centers.Min(p => p.Y);
+            double maxY = centers.Max(p => p.Y);
+
+            var leftBars = allMainBars.Where(c => Math.Abs(c.Center.X - minX) < tolerance).OrderBy(c => c.Center.Y).ToList();
+            var topBars = allMainBars.Where(c => Math.Abs(c.Center.Y - maxY) < tolerance).OrderBy(c => c.Center.X).ToList();
+            var rightBars = allMainBars.Where(c => Math.Abs(c.Center.X - maxX) < tolerance).OrderByDescending(c => c.Center.Y).ToList();
+            var bottomBars = allMainBars.Where(c => Math.Abs(c.Center.Y - minY) < tolerance).OrderByDescending(c => c.Center.X).ToList();
+
+            if (!leftBars.Any() || !topBars.Any() || !rightBars.Any() || !bottomBars.Any())
+            {
+                return numberedBars;
+            }
+
+            pathBars.AddRange(leftBars);
+            pathBars.AddRange(topBars.Skip(1));
+            pathBars.AddRange(rightBars.Skip(1));
+
+            if (bottomBars.Count > 2)
+            {
+                pathBars.AddRange(bottomBars.Skip(1).Take(bottomBars.Count - 2));
+            }
+
+            for (int i = 0; i < pathBars.Count; i++)
+            {
+                numberedBars.Add(i + 1, pathBars[i]);
+            }
+
+            cornerBars.Add(leftBars.First());
+            cornerBars.Add(topBars.First());
+            cornerBars.Add(rightBars.First());
+            cornerBars.Add(bottomBars.First());
+
+            if (bottomBars.Count > 2) horizontalNonCornerCount += bottomBars.Count - 2;
+            //if (topBars.Count > 2) horizontalNonCornerCount += topBars.Count - 2;
+            if (leftBars.Count > 2) verticalNonCornerCount += leftBars.Count - 2;
+            //if (rightBars.Count > 2) verticalNonCornerCount += rightBars.Count - 2;
+
+            return numberedBars;
+        }
+
+        /// <summary>
+        /// (⭐ B-5 - "유한 십자선" 로직) JBar를 식별합니다.
+        /// - 4개의 코너 철근을 기준으로 "유한한 십자선"을 정의하고,
+        /// - 이 십자선과 "물리적으로 교차"하는 선만 J-Bar로 간주합니다.
+        /// </summary>
+        private void FindJBars(
+            List<Line> allLines,
+            double imaginaryCenterX, double imaginaryCenterY, // (십자선의 X, Y 좌표)
+            List<Circle> cornerBars, // (십자선의 "경계"를 정의)
+            out List<Line> jBarsHorizontal,
+            out List<Line> jBarsVertical)
+        {
+            jBarsHorizontal = new List<Line>();
+            jBarsVertical = new List<Line>();
+
+            const double tolerance = 1e-6; // 기하학적 계산용
+
+            if (!allLines.Any() || cornerBars == null || cornerBars.Count < 4) return;
+
+            // 1. (⭐ 신규) "유한 십자선"의 경계(길이)를 코너 철근으로 정의
+            var cornerCenters = cornerBars.Select(c => c.Center).ToList();
+            double crosshairMinX = cornerCenters.Min(p => p.X); // 수평 십자선 시작 X
+            double crosshairMaxX = cornerCenters.Max(p => p.X); // 수평 십자선 끝 X
+            double crosshairMinY = cornerCenters.Min(p => p.Y); // 수직 십자선 시작 Y
+            double crosshairMaxY = cornerCenters.Max(p => p.Y); // 수직 십자선 끝 Y
+
+            foreach (var line in allLines)
+            {
+                bool isHorizontal = Math.Abs(line.Delta.Y) < tolerance;
+                bool isVertical = Math.Abs(line.Delta.X) < tolerance;
+                if (!isHorizontal && !isVertical) continue;
+
+                if (isHorizontal)
+                {
+                    // (⭐ "수평 J-Bar"가 "수직 십자선"과 교차하는지 검사)
+                    double jbarY = line.StartPoint.Y;
+                    double jbarMinX = Math.Min(line.StartPoint.X, line.EndPoint.X);
+                    double jbarMaxX = Math.Max(line.StartPoint.X, line.EndPoint.X);
+
+                    // 1. J-Bar가 십자선의 X축을 통과하는가?
+                    bool crossesX = (jbarMinX <= imaginaryCenterX + tolerance &&
+                                     jbarMaxX >= imaginaryCenterX - tolerance);
+
+                    // 2. J-Bar가 십자선의 Y길이(경계) "안"에 있는가?
+                    bool withinY = (jbarY >= crosshairMinY - tolerance &&
+                                    jbarY <= crosshairMaxY + tolerance);
+
+                    if (crossesX && withinY)
+                    {
+                        jBarsHorizontal.Add(line);
+                    }
+                }
+                else // isVertical
+                {
+                    // (⭐ "수직 J-Bar"가 "수평 십자선"과 교차하는지 검사)
+                    double jbarX = line.StartPoint.X;
+                    double jbarMinY = Math.Min(line.StartPoint.Y, line.EndPoint.Y);
+                    double jbarMaxY = Math.Max(line.StartPoint.Y, line.EndPoint.Y);
+
+                    // 1. J-Bar가 십자선의 Y축을 통과하는가?
+                    bool crossesY = (jbarMinY <= imaginaryCenterY + tolerance &&
+                                     jbarMaxY >= imaginaryCenterY - tolerance);
+
+                    // 2. J-Bar가 십자선의 X길이(경계) "안"에 있는가?
+                    bool withinX = (jbarX >= crosshairMinX - tolerance &&
+                                    jbarX <= crosshairMaxX + tolerance);
+
+                    if (crossesY && withinX)
+                    {
+                        jBarsVertical.Add(line);
+                    }
+                }
+            }
+        }
+
+
+        /// <summary>
+        /// (B-6) 가장 가까운 철근 찾기 (FindClosestBar)
+        /// </summary>
+        private KeyValuePair<int, Circle> FindClosestBar(Point3d fromPoint, Dictionary<int, Circle> numberedBars)
+        {
+            return numberedBars
+                .OrderBy(pair => pair.Value.Center.DistanceTo(fromPoint))
+                .First();
+        }
+
+        /// <summary>
+        /// (B-7 - "방향" 수정된 로직) JBar의 "상대 위치"를 계산하여 관계를 생성합니다.
+        /// </summary>
+        private List<JBarRelationship> AnalyzeJBarRelationships(
+            Dictionary<int, Circle> numberedBars,
+            List<Line> jBarsHorizontal,
+            List<Line> jBarsVertical)
+        {
+            var results = new List<JBarRelationship>();
+
+            // 1. 수평 JBar 분석 (-> "Above" / "Below")
+            foreach (var hJBar in jBarsHorizontal)
+            {
+                var bar1 = FindClosestBar(hJBar.StartPoint, numberedBars);
+                var bar2 = FindClosestBar(hJBar.EndPoint, numberedBars);
+
+                var barKeys = new List<int> { bar1.Key };
+                if (bar1.Key != bar2.Key)
+                {
+                    barKeys.Add(bar2.Key);
+                }
+
+                double jbarY = hJBar.StartPoint.Y;
+                string direction = (jbarY > bar1.Value.Center.Y) ? "Above" : "Below";
+
+                results.Add(new JBarRelationship(barKeys, direction));
+            }
+
+            // 2. 수직 JBar 분석 (-> "Left" / "Right")
+            foreach (var vJBar in jBarsVertical)
+            {
+                var bar1 = FindClosestBar(vJBar.StartPoint, numberedBars);
+                var bar2 = FindClosestBar(vJBar.EndPoint, numberedBars);
+
+                var barKeys = new List<int> { bar1.Key };
+                if (bar1.Key != bar2.Key)
+                {
+                    barKeys.Add(bar2.Key);
+                }
+
+                double jbarX = vJBar.StartPoint.X;
+                string direction = (jbarX > bar1.Value.Center.X) ? "Right" : "Left";
+
+                results.Add(new JBarRelationship(barKeys, direction));
+            }
+            return results;
+        }
+
+    } // end of partial class
+} // end of namespace
