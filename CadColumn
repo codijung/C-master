@@ -1,0 +1,693 @@
+using Autodesk.AutoCAD.Runtime;
+using Autodesk.AutoCAD.ApplicationServices;
+using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.Geometry;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text; // For StringBuilder
+using System.IO;
+using Newtonsoft.Json;
+
+namespace ConveniencePlugin
+{
+    // ==========================================================
+    // 데이터 모델 클래스 (Data Models)
+    // ==========================================================
+
+    #region (A) 일람표(Schedule) 분석용 데이터 모델
+
+    public class ColumnListElements
+    {
+        public string Sign { get; set; } = "부호";
+        public string Section { get; set; } = "단면";
+        public string MainBar { get; set; } = "MAINBAR";
+        public string HoopMid { get; set; } = "HOOP(MID)";
+        public string HoopEnd { get; set; } = "HOOP(END)";
+
+        public HashSet<string> ToHeaderSetNoSpace()
+        {
+            return new HashSet<string> {
+                Sign.Replace(" ", ""), Section.Replace(" ", ""),
+                MainBar.Replace(" ", ""), HoopMid.Replace(" ", ""),
+                HoopEnd.Replace(" ", "")
+            };
+        }
+    }
+
+    public class ColumnListElementsSearchY
+    {
+        public double SignMaxY { get; set; }
+        public double SignMinY { get; set; }
+        public double SectionMaxY { get; set; }
+        public double SectionMinY { get; set; }
+        public double MainBarMaxY { get; set; }
+        public double MainBarMinY { get; set; }
+        public double HoopMidMaxY { get; set; }
+        public double HoopMidMinY { get; set; }
+        public double HoopEndMaxY { get; set; }
+        public double HoopEndMinY { get; set; }
+        public double SectionOverallMaxY { get; set; }
+        public double SectionOverallMinY { get; set; }
+    }
+
+    public class ColumnListBundle
+    {
+        public string Sign { get; set; } = "";
+        public double MinX { get; set; }
+        public double MaxX { get; set; }
+        public ColumnListElementsSearchY RowSection { get; set; }
+        public string MainBarNumber { get; set; } = "";
+        public string MainBarDiameter { get; set; } = "";
+        public string HoopMidDiameter { get; set; } = "";
+        public string HoopMidInterval { get; set; } = "";
+        public string HoopEndDiameter { get; set; } = "";
+        public string HoopEndInterval { get; set; } = "";
+        public SectionElements DetailAnalysis { get; set; }
+    }
+
+    public class ColumnListTextData
+    {
+        public string Text { get; }
+        public string TextNoSpace { get; }
+        public Point3d Position { get; }
+        public Entity OriginalEntity { get; }
+
+        public ColumnListTextData(Entity ent, string text, Point3d pos)
+        {
+            OriginalEntity = ent;
+            Text = text.Trim();
+            Position = pos;
+            TextNoSpace = this.Text.Replace(" ", "");
+        }
+    }
+
+    #endregion
+
+    #region (B) 단면 상세도(Detail) 분석용 데이터 모델
+
+
+    /// <summary>
+    /// (⭐ 최종 수정 2) JBar의 "상대 위치"와 "연결된 주철근 번호" 저장
+    /// </summary>
+    public class JBarRelationship
+    {
+        /// <summary>
+        /// J-Bar의 상대 위치 (예: "Above", "Below", "Left", "Right")
+        /// </summary>
+        public string RelativeDirection { get; }
+
+        /// <summary>
+        /// 이 J-Bar가 연결하는 주철근의 번호 리스트 (예: [3, 8])
+        /// </summary>
+        public List<int> RelatedBarNumbers { get; } = new List<int>();
+
+        /// <summary>
+        /// 
+        /// </summary>
+        /// <param name="barNumbers">연결된 철근 번호들</param>
+        /// <param name="direction">"Above", "Below", "Left", "Right"</param>
+        public JBarRelationship(List<int> barNumbers, string direction)
+        {
+            RelatedBarNumbers = barNumbers.OrderBy(n => n).ToList(); // 번호순으로 정렬
+            RelativeDirection = direction;
+        }
+    }
+
+    // ... (SectionElements 클래스 등은 동일) ...
+
+    public class SectionElements
+    {
+        public string Width { get; set; }
+        public string Height { get; set; }
+        public int TotalMainBars { get; set; }
+        public int HorizontalNonCornerBars { get; set; }
+        public int VerticalNonCornerBars { get; set; }
+        public List<JBarRelationship> JBars { get; set; }
+
+        public SectionElements()
+        {
+            JBars = new List<JBarRelationship>();
+        }
+    }
+
+    #endregion
+
+    // ==========================================================
+    // 메인 로직 클래스 (Partial 1)
+    // ==========================================================
+    public partial class MyCommands
+    {
+        /// <summary>
+        /// (⭐ 0단계 - 메인) 일람표 및 "포함된 단면 상세도" 읽기 명령
+        /// </summary>
+        [CommandMethod("ReadSchedule")]
+        public void ReadColumnSchedule()
+        {
+            Editor ed = Application.DocumentManager.MdiActiveDocument.Editor;
+            Database db = Application.DocumentManager.MdiActiveDocument.Database;
+
+            try
+            {
+                // 1. 헤더 정의
+                var elements = new ColumnListElements();
+
+                // 2. 객체 선택
+                SelectionSet sset = SelectAllScheduleObjects(ed);
+                if (sset == null) return;
+
+                // 3. 객체 추출 (Block 분해 로직 포함)
+                List<ColumnListTextData> allTexts;
+                List<Line> horizontalLines;
+                List<Line> verticalLines;
+                List<Entity> allDrawingObjects; // 상세도 객체 후보
+
+                ExtractScheduleEntities(db, sset, ed,
+                    out allTexts,
+                    out horizontalLines,
+                    out verticalLines,
+                    out allDrawingObjects);
+
+                if (allTexts.Count == 0 || horizontalLines.Count == 0 || verticalLines.Count == 0)
+                {
+                    ed.WriteMessage("\n[오류] 헤더 또는 라인이 부족하여 그리드를 정의할 수 없습니다.");
+                    return;
+                }
+
+                // 4. "행 섹션(Y-Zone)" 정의
+                var rowZones = DefineRowZones(allTexts, horizontalLines, elements);
+                if (rowZones.Count == 0)
+                {
+                    ed.WriteMessage("\n[오류] '부호' 헤더를 기준으로 행 섹션을 정의할 수 없습니다.");
+                    return;
+                }
+
+                // 5. "열(Column)" 앵커 찾기 및 Bundle 리스트 생성
+                var allBundles = DefineColumnBundles(allTexts, verticalLines, rowZones, elements);
+
+                // 6. Bundle 텍스트 데이터 채우기 (MAINBAR, HOOP 등)
+                PopulateBundleData(allBundles, allTexts);
+
+                // --- 7. (⭐ 디버깅 제거) "단면" 셀의 상세도를 분석 ---
+                ed.WriteMessage("\n--- 단면 상세도 분석 시작 ---");
+
+                // (디버깅용 Transaction 제거)
+                foreach (var bundle in allBundles)
+                {
+                    var yMap = bundle.RowSection;
+                    double minX = bundle.MinX;
+                    double maxX = bundle.MaxX;
+                    double minY = yMap.SectionMinY;
+                    double maxY = yMap.SectionMaxY;
+
+                    if (Math.Abs(minY) < 1e-6 && Math.Abs(maxY) < 1e-6)
+                    {
+                        ed.WriteMessage($"\n[경고] '{bundle.Sign}'의 단면(Section) Y좌표가 정의되지 않았습니다.");
+                        continue;
+                    }
+
+                    Point3d pt1 = new Point3d(minX, minY, 0);
+                    Point3d pt2 = new Point3d(maxX, maxY, 0);
+
+                    // (디버깅용 노란색 사각형 그리기 코드 제거)
+
+                    // (⭐ 핵심) class2.cs의 함수 호출
+                    SectionElements analysisResults = AnalyzeSectionDetailByRange(
+                        pt1, pt2,
+                        allDrawingObjects
+                    );
+
+                    if (analysisResults != null)
+                    {
+                        bundle.DetailAnalysis = analysisResults;
+                        ed.WriteMessage($"\n> '{bundle.Sign}' 단면 분석 완료 (W:{analysisResults.Width}, H:{analysisResults.Height})");
+                    }
+                    else
+                    {
+                        ed.WriteMessage($"\n> '{bundle.Sign}' 단면 분석 실패 (범위 내 객체 부족).");
+                    }
+                }
+
+                // ... (7단계 '단면 상세도 분석 완료' 메시지 출력 다음) ...
+                ed.WriteMessage("\n--- 단면 상세도 분석 완료 ---");
+
+                // --- 8. (⭐ 신규) 파일로 내보내기 ---
+
+                // 사용자의 바탕화면 경로를 가져옵니다.
+                string desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
+                // 저장할 파일 경로와 이름을 지정합니다.
+                string savePath = Path.Combine(desktopPath, "ScheduleAnalysis_Output.json");
+
+                // JSON 내보내기 함수 호출
+                ExportBundlesToJson(allBundles, savePath);
+
+                ed.WriteMessage($"\n--- {allBundles.Count}개 번들 데이터를 JSON 파일로 내보냈습니다 ---");
+                ed.WriteMessage($"경로: {savePath}");
+
+
+
+                // 8. 최종 번들 리스트를 출력 (콘솔)
+                //PrintBundleList(ed, allBundles);
+
+                // 9. 시각화 함수 호출 (도면)
+                //DrawBundleVisuals(db, ed, allBundles);
+
+            }
+            catch (System.Exception ex)
+            {
+                Application.ShowAlertDialog($"오류 발생:\n{ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        private void ExportBundlesToJson(List<ColumnListBundle> bundles, string filePath)
+        {
+            try
+            {
+                // 1. C# 객체 리스트를 JSON 문자열로 변환 (Formatting.Indented: 보기 좋게 들여쓰기)
+                string jsonOutput = JsonConvert.SerializeObject(bundles, Formatting.Indented);
+
+                // 2. 문자열을 실제 파일로 저장 (UTF-8로 인코딩)
+                File.WriteAllText(filePath, jsonOutput, Encoding.UTF8);
+            }
+            catch (System.Exception ex)
+            {
+                Application.DocumentManager.MdiActiveDocument.Editor.WriteMessage(
+                    $"\n[오류] JSON 파일 저장 중 오류 발생: {ex.Message}");
+            }
+        }
+        // ==========================================================
+        // (A) 일람표(Schedule) 분석 헬퍼 함수
+        // ==========================================================
+
+        private SelectionSet SelectAllScheduleObjects(Editor ed)
+        {
+            PromptSelectionOptions selOpts = new PromptSelectionOptions();
+            selOpts.MessageForAdding = "\n일람표 전체(헤더, 데이터, 라인, 상세도)를 선택하세요: ";
+            PromptSelectionResult selRes = ed.GetSelection(selOpts);
+            return selRes.Status == PromptStatus.OK ? selRes.Value : null;
+        }
+
+        private void ExtractScheduleEntities(Database db, SelectionSet sset, Editor ed,
+            out List<ColumnListTextData> allTexts,
+            out List<Line> horizontalLines,
+            out List<Line> verticalLines,
+            out List<Entity> allDrawingObjects)
+        {
+            allTexts = new List<ColumnListTextData>();
+            horizontalLines = new List<Line>();
+            verticalLines = new List<Line>();
+            allDrawingObjects = new List<Entity>();
+            const double lineTolerance = 1e-6;
+
+            Stack<Tuple<Entity, Matrix3d>> ProcessingStack = new Stack<Tuple<Entity, Matrix3d>>();
+
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                foreach (SelectedObject so in sset)
+                {
+                    Entity ent = tr.GetObject(so.ObjectId, OpenMode.ForRead) as Entity;
+                    if (ent == null) continue;
+                    ProcessingStack.Push(new Tuple<Entity, Matrix3d>(ent, Matrix3d.Identity));
+                }
+
+                // (class1.cs -> ExtractScheduleEntities 함수 내부)
+                // ...
+                while (ProcessingStack.Count > 0)
+                {
+                    var (currEnt, currXform) = ProcessingStack.Pop();
+                    string text = null;
+                    Point3d pos = Point3d.Origin;
+
+                    try
+                    {
+                        // (⭐ 수정된 Line 처리 로직)
+                        if (currEnt is Line line)
+                        {
+                            Line transformedLine = line.GetTransformedCopy(currXform) as Line;
+                            if (transformedLine == null) continue;
+
+                            // 1. 그리드(Grid)용 리스트에 추가 (조건부)
+                            if (Math.Abs(transformedLine.Delta.Y) < lineTolerance)
+                                horizontalLines.Add(transformedLine);
+                            else if (Math.Abs(transformedLine.Delta.X) < lineTolerance)
+                                verticalLines.Add(transformedLine);
+
+                            // 2. 상세도 분석용 리스트에 "모든" 선 추가 (무조건)
+                            // (J-Bar는 수평/수직선이므로, 이 코드가 반드시 필요합니다)
+                            allDrawingObjects.Add(transformedLine);
+                        }
+                        else if (currEnt is Polyline pline)
+                        {
+                            ProcessPolyline(pline, currXform, ProcessingStack);
+                        }
+                        else if (currEnt is DBText dbT) { text = dbT.TextString; pos = dbT.Position.TransformBy(currXform); }
+                        else if (currEnt is MText mT) { text = mT.Text; pos = mT.Location.TransformBy(currXform); }
+                        else if (currEnt is AttributeReference att) { text = att.TextString; pos = att.Position.TransformBy(currXform); }
+
+                        // (블록 분해)
+                        else if (currEnt is BlockReference blk)
+                        {
+                            BlockTableRecord btr = (BlockTableRecord)tr.GetObject(blk.BlockTableRecord, OpenMode.ForRead);
+                            Matrix3d newXform = blk.BlockTransform.PreMultiplyBy(currXform);
+                            foreach (ObjectId id in btr)
+                            {
+                                Entity entInBlock = tr.GetObject(id, OpenMode.ForRead) as Entity;
+                                if (entInBlock != null)
+                                {
+                                    ProcessingStack.Push(new Tuple<Entity, Matrix3d>(entInBlock, newXform));
+                                }
+                            }
+                        }
+                        else if (currEnt is Circle circle)
+                        {
+                            allDrawingObjects.Add(circle.GetTransformedCopy(currXform));
+                        }
+                        else if (currEnt is Dimension dim)
+                        {
+                            allDrawingObjects.Add(dim.GetTransformedCopy(currXform));
+                        }
+                        else
+                        {
+                            // (기타 다른 객체들도 추가)
+                            allDrawingObjects.Add(currEnt.GetTransformedCopy(currXform));
+                        }
+
+                        // (텍스트 저장)
+                        if (!string.IsNullOrWhiteSpace(text))
+                        {
+                            allTexts.Add(new ColumnListTextData(currEnt, text, pos));
+                        }
+                    }
+                    catch (System.Exception ex)
+                    {
+                        ed.WriteMessage($"\n[경고] 객체(Handle: {currEnt.Handle}) 처리 중 오류: {ex.Message}");
+                    }
+                } // end while
+                  // ...
+
+                tr.Commit();
+            }
+        }
+
+        private void ProcessPolyline(Polyline pline, Matrix3d currXform, Stack<Tuple<Entity, Matrix3d>> ProcessingStack)
+        {
+            if (pline.NumberOfVertices < 2) return;
+            for (int i = 0; i < pline.NumberOfVertices; i++)
+            {
+                SegmentType segType = pline.GetSegmentType(i);
+                if (segType == SegmentType.Line)
+                {
+                    LineSegment2d seg = pline.GetLineSegment2dAt(i);
+                    Line segmentLine = new Line(
+                        new Point3d(seg.StartPoint.X, seg.StartPoint.Y, pline.Elevation),
+                        new Point3d(seg.EndPoint.X, seg.EndPoint.Y, pline.Elevation)
+                    );
+                    ProcessingStack.Push(new Tuple<Entity, Matrix3d>(segmentLine, currXform));
+                }
+            }
+        }
+
+        private List<ColumnListElementsSearchY> DefineRowZones(List<ColumnListTextData> allTexts, List<Line> horizontalLines, ColumnListElements elements)
+        {
+            var searchYSections = new List<ColumnListElementsSearchY>();
+            var headerSetNoSpace = elements.ToHeaderSetNoSpace();
+
+            var masterHeaders = allTexts
+                .Where(h => h.TextNoSpace == elements.Sign.Replace(" ", ""))
+                .OrderByDescending(h => h.Position.Y)
+                .ToList();
+
+            var otherHeaders = allTexts
+                .Where(h => h.TextNoSpace != elements.Sign.Replace(" ", "") &&
+                            headerSetNoSpace.Contains(h.TextNoSpace))
+                .ToList();
+
+            for (int i = 0; i < masterHeaders.Count; i++)
+            {
+                var masterHeader = masterHeaders[i];
+                var searchY = new ColumnListElementsSearchY();
+
+                var lineAboveMaster = horizontalLines.Where(L => L.StartPoint.Y > masterHeader.Position.Y).OrderBy(L => L.StartPoint.Y - masterHeader.Position.Y).FirstOrDefault();
+                if (lineAboveMaster == null) continue;
+                searchY.SectionOverallMaxY = lineAboveMaster.StartPoint.Y;
+
+                if (i == masterHeaders.Count - 1)
+                {
+                    var lowestLine = horizontalLines.Where(L => L.StartPoint.Y < searchY.SectionOverallMaxY).OrderBy(L => L.StartPoint.Y).FirstOrDefault();
+                    searchY.SectionOverallMinY = lowestLine?.StartPoint.Y ?? double.MinValue;
+                }
+                else
+                {
+                    var nextMasterHeader = masterHeaders[i + 1];
+                    var nextLineAbove = horizontalLines.Where(L => L.StartPoint.Y > nextMasterHeader.Position.Y).OrderBy(L => L.StartPoint.Y - nextMasterHeader.Position.Y).FirstOrDefault();
+                    if (nextLineAbove == null) continue;
+                    searchY.SectionOverallMinY = nextLineAbove.StartPoint.Y;
+                }
+
+                var headersInThisSection = otherHeaders.Concat(new[] { masterHeader })
+                    .Where(h => h.Position.Y < searchY.SectionOverallMaxY && h.Position.Y > searchY.SectionOverallMinY)
+                    .ToList();
+
+                foreach (var header in headersInThisSection)
+                {
+                    // (⭐ X좌표 필터링 적용된 버전)
+                    double headerX = header.Position.X;
+                    var lineAbove = horizontalLines
+                        .Where(L =>
+                            L.StartPoint.Y > header.Position.Y &&
+                            L.StartPoint.Y <= searchY.SectionOverallMaxY &&
+                            (headerX >= Math.Min(L.StartPoint.X, L.EndPoint.X) &&
+                             headerX <= Math.Max(L.StartPoint.X, L.EndPoint.X))
+                        )
+                        .OrderBy(L => L.StartPoint.Y - header.Position.Y)
+                        .FirstOrDefault();
+
+                    var lineBelow = horizontalLines
+                        .Where(L =>
+                            L.StartPoint.Y < header.Position.Y &&
+                            L.StartPoint.Y >= searchY.SectionOverallMinY &&
+                            (headerX >= Math.Min(L.StartPoint.X, L.EndPoint.X) &&
+                             headerX <= Math.Max(L.StartPoint.X, L.EndPoint.X))
+                        )
+                        .OrderBy(L => header.Position.Y - L.StartPoint.Y)
+                        .FirstOrDefault();
+                    // (⭐ 적용 끝)
+
+                    if (lineAbove == null || lineBelow == null) continue;
+
+                    string key = header.TextNoSpace;
+                    if (key == elements.Sign.Replace(" ", "")) { searchY.SignMaxY = lineAbove.StartPoint.Y; searchY.SignMinY = lineBelow.StartPoint.Y; }
+                    else if (key == elements.Section.Replace(" ", "")) { searchY.SectionMaxY = lineAbove.StartPoint.Y; searchY.SectionMinY = lineBelow.StartPoint.Y; }
+                    else if (key == elements.MainBar.Replace(" ", "")) { searchY.MainBarMaxY = lineAbove.StartPoint.Y; searchY.MainBarMinY = lineBelow.StartPoint.Y; }
+                    else if (key == elements.HoopMid.Replace(" ", "")) { searchY.HoopMidMaxY = lineAbove.StartPoint.Y; searchY.HoopMidMinY = lineBelow.StartPoint.Y; }
+                    else if (key == elements.HoopEnd.Replace(" ", "")) { searchY.HoopEndMaxY = lineAbove.StartPoint.Y; searchY.HoopEndMinY = lineBelow.StartPoint.Y; }
+                }
+
+                searchYSections.Add(searchY);
+            }
+            return searchYSections;
+        }
+
+        private List<ColumnListBundle> DefineColumnBundles(
+            List<ColumnListTextData> allTexts,
+            List<Line> verticalLines,
+            List<ColumnListElementsSearchY> searchYSections,
+            ColumnListElements elements)
+        {
+            var allBundles = new List<ColumnListBundle>();
+            var headerSetNoSpace = elements.ToHeaderSetNoSpace();
+            var columnAnchors = new List<Tuple<ColumnListTextData, ColumnListElementsSearchY>>();
+
+            foreach (var section in searchYSections)
+            {
+                var anchorsInThisSection = allTexts
+                    .Where(t => t.Position.Y < section.SignMaxY && t.Position.Y > section.SignMinY &&
+                                !headerSetNoSpace.Contains(t.TextNoSpace))
+                    .ToList();
+
+                foreach (var anchor in anchorsInThisSection)
+                {
+                    columnAnchors.Add(new Tuple<ColumnListTextData, ColumnListElementsSearchY>(anchor, section));
+                }
+            }
+
+            foreach (var pair in columnAnchors)
+            {
+                var anchorText = pair.Item1;
+                var section = pair.Item2;
+                double textY = anchorText.Position.Y;
+
+                var lineLeft = verticalLines.Where(L => L.StartPoint.X < anchorText.Position.X && Math.Min(L.StartPoint.Y, L.EndPoint.Y) <= textY && Math.Max(L.StartPoint.Y, L.EndPoint.Y) >= textY).OrderByDescending(L => L.StartPoint.X).FirstOrDefault();
+                var lineRight = verticalLines.Where(L => L.StartPoint.X > anchorText.Position.X && Math.Min(L.StartPoint.Y, L.EndPoint.Y) <= textY && Math.Max(L.StartPoint.Y, L.EndPoint.Y) >= textY).OrderBy(L => L.StartPoint.X).FirstOrDefault();
+
+                if (lineLeft != null && lineRight != null)
+                {
+                    allBundles.Add(new ColumnListBundle
+                    {
+                        Sign = anchorText.Text,
+                        MaxX = lineRight.StartPoint.X,
+                        MinX = lineLeft.StartPoint.X,
+                        RowSection = section
+                    });
+                }
+            }
+            return allBundles;
+        }
+
+        private ColumnListTextData FindTextInBounds(
+            List<ColumnListTextData> allTexts,
+            double minX, double maxX,
+            double minY, double maxY)
+        {
+            return allTexts.FirstOrDefault(t =>
+                t.Position.X >= minX && t.Position.X <= maxX &&
+                t.Position.Y >= minY && t.Position.Y <= maxY
+            );
+        }
+
+        private void PopulateBundleData(List<ColumnListBundle> allBundles, List<ColumnListTextData> allTexts)
+        {
+            foreach (var bundle in allBundles)
+            {
+                double minX = bundle.MinX;
+                double maxX = bundle.MaxX;
+                var yMap = bundle.RowSection;
+
+                try
+                {
+                    var mainBarText = FindTextInBounds(allTexts, minX, maxX, yMap.MainBarMinY, yMap.MainBarMaxY);
+                    if (mainBarText != null)
+                    {
+                        var parts = mainBarText.Text.Split('-');
+                        if (parts.Length == 2)
+                        {
+                            bundle.MainBarNumber = parts[0].Trim();
+                            bundle.MainBarDiameter = parts[1].Trim();
+                        }
+                    }
+
+                    var hoopMidText = FindTextInBounds(allTexts, minX, maxX, yMap.HoopMidMinY, yMap.HoopMidMaxY);
+                    if (hoopMidText != null)
+                    {
+                        var parts = hoopMidText.Text.Split('@');
+                        if (parts.Length == 2)
+                        {
+                            bundle.HoopMidDiameter = parts[0].Trim();
+                            bundle.HoopMidInterval = parts[1].Trim();
+                        }
+                    }
+
+                    var hoopEndText = FindTextInBounds(allTexts, minX, maxX, yMap.HoopEndMinY, yMap.HoopEndMaxY);
+                    if (hoopEndText != null)
+                    {
+                        var parts = hoopEndText.Text.Split('@');
+                        if (parts.Length == 2)
+                        {
+                            bundle.HoopEndDiameter = parts[0].Trim();
+                            bundle.HoopEndInterval = parts[1].Trim();
+                        }
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    Application.DocumentManager.MdiActiveDocument.Editor.WriteMessage(
+                        $"\n[경고] '{bundle.Sign}' 데이터 파싱 중 오류: {ex.Message}");
+                }
+            }
+        }
+
+
+        private void PrintBundleList(Editor ed, List<ColumnListBundle> bundles)
+        {
+            ed.WriteMessage($"\n--- ColumnListBundle 분석 완료 ({bundles.Count}개) ---");
+            int i = 1;
+
+            foreach (var bundle in bundles.OrderByDescending(b => b.RowSection.SectionOverallMaxY).ThenBy(b => b.MinX))
+            {
+                ed.WriteMessage($"\n[Bundle {i++}]");
+                ed.WriteMessage($"  Sign: {bundle.Sign}");
+                ed.WriteMessage($"  X-Range: {bundle.MinX:F2} ~ {bundle.MaxX:F2}");
+                ed.WriteMessage($"    -> MainBar:   {bundle.MainBarNumber}-{bundle.MainBarDiameter}");
+                ed.WriteMessage($"    -> Hoop(Mid): {bundle.HoopMidDiameter}@{bundle.HoopMidInterval}");
+                ed.WriteMessage($"    -> Hoop(End): {bundle.HoopEndDiameter}@{bundle.HoopEndInterval}");
+
+                if (bundle.DetailAnalysis != null)
+                {
+                    var detail = bundle.DetailAnalysis;
+                    ed.WriteMessage($"    -> (Detail) Size: {detail.Width} x {detail.Height}");
+                    ed.WriteMessage($"    -> (Detail) MainBars: {detail.TotalMainBars} 개");
+                    ed.WriteMessage($"    -> (Detail) JBars: {detail.JBars.Count} 개");
+                }
+                else
+                {
+                    ed.WriteMessage($"    -> (Detail) 분석 데이터 없음.");
+                }
+            }
+        }
+
+        private void DrawBundleVisuals(Database db, Editor ed, List<ColumnListBundle> bundles)
+        {
+            using (Transaction tr = db.TransactionManager.StartTransaction())
+            {
+                try
+                {
+                    BlockTable bt = tr.GetObject(db.BlockTableId, OpenMode.ForRead) as BlockTable;
+                    BlockTableRecord ms = tr.GetObject(bt[BlockTableRecord.ModelSpace], OpenMode.ForWrite) as BlockTableRecord;
+
+                    foreach (var bundle in bundles)
+                    {
+                        double minX = bundle.MinX;
+                        double maxX = bundle.MaxX;
+                        double minY = bundle.RowSection.SectionOverallMinY;
+                        double maxY = bundle.RowSection.SectionOverallMaxY;
+
+                        Polyline rect = new Polyline();
+                        rect.AddVertexAt(0, new Point2d(minX, minY), 0, 0, 0);
+                        rect.AddVertexAt(1, new Point2d(maxX, minY), 0, 0, 0);
+                        rect.AddVertexAt(2, new Point2d(maxX, maxY), 0, 0, 0);
+                        rect.AddVertexAt(3, new Point2d(minX, maxY), 0, 0, 0);
+                        rect.Closed = true;
+                        rect.ColorIndex = 1; // Red
+
+                        ms.AppendEntity(rect);
+                        tr.AddNewlyCreatedDBObject(rect, true);
+
+                        MText dataText = new MText();
+                        var content = new StringBuilder();
+                        content.AppendLine($@"{{\L{bundle.Sign}}}");
+                        if (!string.IsNullOrEmpty(bundle.MainBarNumber))
+                        {
+                            content.AppendLine($"Main: {bundle.MainBarNumber}-{bundle.MainBarDiameter}");
+                        }
+                        if (bundle.DetailAnalysis != null)
+                        {
+                            content.AppendLine($@"Detail: {bundle.DetailAnalysis.Width}x{bundle.DetailAnalysis.Height} ({bundle.DetailAnalysis.TotalMainBars}bars)");
+                        }
+                        dataText.Contents = content.ToString();
+
+                        Point3d center = new Point3d((minX + maxX) / 2.0, (bundle.RowSection.SignMinY + bundle.RowSection.SignMaxY) / 2.0, 0);
+                        dataText.Location = center;
+                        dataText.Attachment = AttachmentPoint.MiddleCenter;
+
+                        double rectHeight = bundle.RowSection.SignMaxY - bundle.RowSection.SignMinY;
+                        dataText.TextHeight = rectHeight / 4.0;
+                        dataText.Width = (maxX - minX) * 0.9;
+                        dataText.ColorIndex = 2; // Yellow
+
+                        ms.AppendEntity(dataText);
+                        tr.AddNewlyCreatedDBObject(dataText, true);
+                    }
+
+                    tr.Commit();
+                    ed.WriteMessage($"\n--- {bundles.Count}개의 번들 데이터 시각화를 도면에 그렸습니다. ---");
+                }
+                catch (System.Exception ex)
+                {
+                    ed.WriteMessage($"\n[오류] 시각화 도중 오류 발생: {ex.Message}");
+                    tr.Abort();
+                }
+            }
+        }
+    }
+}
